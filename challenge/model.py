@@ -1,27 +1,17 @@
-"""nano-gpt — the target agents optimize.
-
-`generate_ids(prompt, n_new)` greedily decodes `n_new` tokens from a real GPT-style
-transformer. The reference below is intentionally NAIVE: at every decode step it
-recomputes the full forward pass over the whole sequence from scratch (no KV cache).
-
-An agent's job: make decoding dramatically faster while returning the EXACT same
-token ids. The classic win is a KV cache (reuse past keys/values instead of
-recomputing them) — mathematically identical, so the output tokens are unchanged.
-The arena checks the output on a hidden holdout, so you can't fake it.
-"""
+# strategy: KV cache (legit, big win, IDENTICAL output).
+# Instead of recomputing the whole prefix each step, cache each layer's keys/values
+# and only process the one new token. Mathematically identical -> same argmax tokens.
 import numpy as np
 
 from _gpt import CFG, P, gelu, ln, softmax
 
 
-def forward(ids):
-    """Full forward over the whole sequence -> logits (T, vocab)."""
+def _run(tok_ids, start, caches):
     ne, nh = CFG["n_embd"], CFG["n_head"]
     hd = ne // nh
-    T = len(ids)
-    x = P["wte"][ids] + P["wpe"][:T]
-    mask = np.triu(np.full((T, T), -1e10), 1)
-    for b in P["blocks"]:
+    T = len(tok_ids)
+    x = P["wte"][tok_ids] + P["wpe"][start:start + T]
+    for bi, b in enumerate(P["blocks"]):
         a = ln(x, b["ln1_g"], b["ln1_b"])
         qkv = a @ b["attn_w"] + b["attn_b"]
         q, k, v = np.split(qkv, 3, axis=-1)
@@ -30,8 +20,19 @@ def forward(ids):
             return z.reshape(T, nh, hd).transpose(1, 0, 2)
 
         q, k, v = sh(q), sh(k), sh(v)
-        att = softmax(q @ k.transpose(0, 2, 1) / np.sqrt(hd) + mask)
-        o = (att @ v).transpose(1, 0, 2).reshape(T, ne)
+        c = caches[bi]
+        if c["k"] is None:
+            c["k"], c["v"] = k, v
+        else:
+            c["k"] = np.concatenate([c["k"], k], axis=1)
+            c["v"] = np.concatenate([c["v"], v], axis=1)
+        K, V = c["k"], c["v"]
+        L = K.shape[1]
+        qpos = np.arange(start, start + T)[:, None]
+        kpos = np.arange(L)[None, :]
+        m = np.where(kpos <= qpos, 0.0, -1e10)
+        att = softmax(q @ K.transpose(0, 2, 1) / np.sqrt(hd) + m)
+        o = (att @ V).transpose(1, 0, 2).reshape(T, ne)
         x = x + o @ b["proj_w"] + b["proj_b"]
         a2 = ln(x, b["ln2_g"], b["ln2_b"])
         h = gelu(a2 @ b["fc_w"] + b["fc_b"])
@@ -42,7 +43,14 @@ def forward(ids):
 
 def generate_ids(prompt, n_new):
     ids = list(prompt)
-    for _ in range(n_new):
-        logits = forward(ids)
-        ids.append(int(np.argmax(logits[-1])))
-    return ids[len(prompt):]
+    caches = [{"k": None, "v": None} for _ in P["blocks"]]
+    seqlen = len(ids)
+    logits = _run(ids, 0, caches)
+    out = []
+    for i in range(n_new):
+        out.append(int(np.argmax(logits[-1])))
+        if i == n_new - 1:
+            break
+        logits = _run([out[-1]], seqlen, caches)
+        seqlen += 1
+    return out
